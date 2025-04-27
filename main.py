@@ -1,12 +1,13 @@
 from fastapi import FastAPI, HTTPException, Depends, status
 from pydantic import ValidationError
 import json
-from datetime import date, timedelta
-from typing import Optional
+from datetime import date, timedelta, datetime
+from typing import Optional, List
 
 from schemas import (
     OnboardingData, AssessmentResult, GeminiAssessmentResponse, 
-    GeneratePlanRequest, GeneratePlanResponse, WeeklyPlanResponse, WorkoutPlan, WorkoutSegmentPlan
+    GeneratePlanRequest, GeneratePlanResponse, WeeklyPlanResponse, WorkoutPlan, WorkoutSegmentPlan,
+    WeeklyPlanDetail, WorkoutDetail, WorkoutSegmentDetail, ExerciseDetail
 )
 from core.clients import gemini_model, supabase_client
 from auth.dependencies import get_current_user_id
@@ -351,5 +352,126 @@ async def generate_plan(
         week_start_date=target_week_start,
         message="Weekly plan generated successfully."
     )
+
+@app.get("/plans/week/{week_start_date_str}", response_model=WeeklyPlanDetail)
+async def get_weekly_plan(
+    week_start_date_str: str,
+    current_user_id: str = Depends(get_current_user_id)
+):
+    """Retrieves the detailed weekly plan for a given user and week start date."""
+    print(f"Received request for plan for week {week_start_date_str} for user {current_user_id}")
+
+    try:
+        # Validate and parse the date string
+        week_start_date = date.fromisoformat(week_start_date_str)
+        if week_start_date.weekday() != 0: # 0 is Monday
+             raise ValueError("Week start date must be a Monday.")
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid date format or not a Monday: {e}"
+        )
+
+    try:
+        # 1. Fetch the plan for the user and week
+        plan_res = supabase_client.table('plans')\
+                             .select("id, user_id, week_start_date")\
+                             .eq('user_id', current_user_id)\
+                             .eq('week_start_date', week_start_date.isoformat())\
+                             .maybe_single()\
+                             .execute()
+
+        if not plan_res.data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, 
+                detail=f"Plan not found for the week starting {week_start_date_str}."
+            )
+        
+        plan_data = plan_res.data
+        plan_id = plan_data['id']
+        print(f"Found plan with ID: {plan_id}")
+
+        # 2. Fetch associated workouts
+        workouts_res = supabase_client.table('workouts')\
+                                 .select("*, workout_segments(*, exercises(*))")\
+                                 .eq('plan_id', plan_id)\
+                                 .order('scheduled_date', desc=False)\
+                                 .order('segment_order', desc=False, foreign_table='workout_segments')\
+                                 .execute()
+        
+        if not workouts_res.data:
+            print(f"Warning: Plan {plan_id} found, but no workouts associated.")
+            # Return the plan structure with an empty workouts list
+            return WeeklyPlanDetail(
+                plan_id=plan_id,
+                user_id=plan_data['user_id'],
+                week_start_date=plan_data['week_start_date'],
+                workouts=[]
+            )
+        
+        print(f"Found {len(workouts_res.data)} workouts for plan {plan_id}")
+        
+        # 3. Structure the response using Pydantic models
+        detailed_workouts: List[WorkoutDetail] = []
+        for workout_db in workouts_res.data:
+            detailed_segments: List[WorkoutSegmentDetail] = []
+            if workout_db.get('workout_segments'):
+                for segment_db in workout_db['workout_segments']:
+                    exercise_detail = None
+                    if segment_db.get('exercises'): # exercises is the nested data
+                        exercise_db = segment_db['exercises']
+                        exercise_detail = ExerciseDetail(
+                            id=exercise_db['id'],
+                            name=exercise_db['name'],
+                            youtube_url=exercise_db.get('youtube_url')
+                        )
+                    
+                    detailed_segments.append(
+                        WorkoutSegmentDetail(
+                            id=segment_db['id'],
+                            segment_order=segment_db['segment_order'],
+                            segment_type=segment_db.get('segment_type'),
+                            duration_minutes=segment_db.get('duration_minutes'),
+                            distance_meters=segment_db.get('distance_meters'),
+                            target_intensity=segment_db.get('target_intensity'),
+                            reps=segment_db.get('reps'),
+                            rest_duration_seconds=segment_db.get('rest_duration_seconds'),
+                            notes=segment_db.get('notes'),
+                            exercise=exercise_detail
+                        )
+                    )
+            
+            detailed_workouts.append(
+                 WorkoutDetail(
+                    id=workout_db['id'],
+                    scheduled_date=workout_db['scheduled_date'],
+                    activity_type=workout_db['activity_type'],
+                    title=workout_db.get('title'),
+                    status=workout_db['status'],
+                    user_modified_activity=workout_db['user_modified_activity'],
+                    user_modified_details=workout_db['user_modified_details'],
+                    segments=detailed_segments
+                 )
+            )
+
+        # 4. Assemble the final response object
+        weekly_plan_detail = WeeklyPlanDetail(
+            plan_id=plan_id,
+            user_id=plan_data['user_id'],
+            week_start_date=plan_data['week_start_date'],
+            workouts=detailed_workouts
+        )
+
+        return weekly_plan_detail
+
+    except HTTPException as http_exc:
+        # Re-raise HTTP exceptions directly
+        raise http_exc
+    except Exception as e:
+        print(f"Database error fetching plan details: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to retrieve plan details."
+        )
 
 # Add other endpoints here later (admin, etc.) 
